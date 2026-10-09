@@ -1,6 +1,7 @@
 'use dom';
 
 import "katex/dist/katex.min.css";
+import { attachMobileReaderScroll } from "../lib/mobile-reader-scroll";
 import { Graph } from "@antv/x6";
 import Image from "@tiptap/extension-image";
 import CodeBlock from "@tiptap/extension-code-block";
@@ -142,7 +143,7 @@ type LocalTiptapEditorSharedProps = {
   onResourcePress?: (targetJson: string) => Promise<void>;
   onReady?: (startupMs: number) => Promise<void>;
   onSearchResult?: (count: number, index: number, query: string) => Promise<void>;
-  onReaderScroll?: (scrollTop: number) => Promise<void>;
+  onReaderScroll?: (collapsed: boolean) => Promise<void>;
   onImageExportEvent?: (payloadJson: string) => Promise<void>;
   ref: Ref<LocalTiptapEditorRef>;
   locale: "zh-CN" | "en-US" | "ja" | "pl";
@@ -196,14 +197,6 @@ type ImageExportRequest = {
   showTags?: boolean;
   showUpdatedAt?: boolean;
   branding?: boolean;
-};
-
-const bytesToBase64 = (bytes: Uint8Array) => {
-  let binary = "";
-  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-  }
-  return btoa(binary);
 };
 
 const fallbackPromptParameterKind = (action: AiAction): AiPromptParameterKind =>
@@ -369,7 +362,10 @@ const renderWithBeautifulMermaid = async (source: string, theme: "light" | "dark
       ...THEMES[theme === "dark" ? "zinc-dark" : "zinc-light"],
       transparent: true,
       font: "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
-      padding: 24,
+      padding: 12,
+      nodeSpacing: 16,
+      layerSpacing: 28,
+      componentSpacing: 16,
     });
   } catch {
     return null;
@@ -1260,9 +1256,9 @@ function LocalTiptapEditorImpl(props: LocalTiptapEditorProps) {
       const resolvedTheme = resolveTheme(request.background, request.theme);
       const fontStyle = request.fontStyle ?? "serif";
       const fontSize = request.fontSize ?? "lg";
-      const cardWidth = request.cardWidth ?? "standard";
-      const targetWidth = NOTE_IMAGE_CARD_WIDTH_PIXELS[cardWidth] || 680;
-      const themeCfg = NOTE_IMAGE_THEMES[resolvedTheme] || NOTE_IMAGE_THEMES.slate;
+      const cardWidth = request.cardWidth ?? "wide";
+      const targetWidth = NOTE_IMAGE_CARD_WIDTH_PIXELS[cardWidth] || NOTE_IMAGE_CARD_WIDTH_PIXELS.wide;
+      const themeCfg = NOTE_IMAGE_THEMES[resolvedTheme] || NOTE_IMAGE_THEMES.aurora;
 
       const editorClone = editor.view.dom.cloneNode(true) as HTMLElement;
       editorClone.removeAttribute("contenteditable");
@@ -1375,23 +1371,21 @@ function LocalTiptapEditorImpl(props: LocalTiptapEditorProps) {
             throw new Error("NOTE_IMAGE_RENDER_FAILED");
           }
         }
-        const blob = await new Promise<Blob>((resolve, reject) => {
-          canvas.toBlob(
-            (result) => result ? resolve(result) : reject(new Error("Image renderer returned an empty file")),
-            request.format === "jpeg" ? "image/jpeg" : "image/png",
-            request.format === "jpeg" ? 0.92 : 1,
-          );
-        });
-
         const extension = request.format === "jpeg" ? "jpg" : "png";
         const basename = buildImageExportBasename(request.title, request.fallbackTitle);
         const filename = `${basename}.${extension}`;
         const mimeType = request.format === "jpeg" ? "image/jpeg" : "image/png";
+        // Android WebView can take many seconds to return canvas.toBlob for a
+        // long note. This encodes promptly and gives the bridge base64 directly.
+        const dataUrl = canvas.toDataURL(mimeType, request.format === "jpeg" ? 0.92 : 1);
+        const dataUrlPrefix = `data:${mimeType};base64,`;
+        if (!dataUrl.startsWith(dataUrlPrefix)) throw new Error("Image renderer returned an empty file");
+        const base64 = dataUrl.slice(dataUrlPrefix.length);
 
         reportProgress("transfer");
-        for (let offset = 0; offset < blob.size; offset += IMAGE_EXPORT_CHUNK_BYTES) {
-          const bytes = new Uint8Array(await blob.slice(offset, offset + IMAGE_EXPORT_CHUNK_BYTES).arrayBuffer());
-          await notify({ type: "chunk", chunk: bytesToBase64(bytes) });
+        const chunkChars = (IMAGE_EXPORT_CHUNK_BYTES / 3) * 4;
+        for (let offset = 0; offset < base64.length; offset += chunkChars) {
+          await notify({ type: "chunk", chunk: base64.slice(offset, offset + chunkChars) });
         }
         await notify({
           type: "complete",
@@ -1623,18 +1617,9 @@ function LocalTiptapEditorImpl(props: LocalTiptapEditorProps) {
     const scrollContainer = document.querySelector<HTMLElement>(".edgeever-editor-scroll");
     if (!scrollContainer) return;
 
-    let titleCollapsed = false;
-    const reportScroll = () => {
-      const nextCollapsed = titleCollapsed
-        ? scrollContainer.scrollTop > 4
-        : scrollContainer.scrollTop > 24;
-      if (nextCollapsed === titleCollapsed) return;
-      titleCollapsed = nextCollapsed;
-      void onReaderScrollRef.current?.(scrollContainer.scrollTop);
-    };
-    scrollContainer.addEventListener("scroll", reportScroll, { passive: true });
-    reportScroll();
-    return () => scrollContainer.removeEventListener("scroll", reportScroll);
+    return attachMobileReaderScroll(scrollContainer, (collapsed) => {
+      void onReaderScrollRef.current?.(collapsed);
+    });
   }, [editor, isViewer, visualDiagram]);
 
   const toolbarState = useEditorState({
@@ -2461,6 +2446,7 @@ const createMobileCodeBlockExtension = (
                 suppressErrorRendering: true,
                 theme: "base",
                 themeVariables: getMobileMermaidThemeVariables(theme),
+                flowchart: { nodeSpacing: 25, rankSpacing: 30 },
               });
               const valid = await mermaid.parse(source, { suppressErrors: true });
               if (!valid) {
@@ -3370,7 +3356,7 @@ const getEditorStyles = (theme: "light" | "dark", options?: { viewer?: boolean }
   .edgeever-x6-diagram .x6-node { cursor: pointer; }
   .edgeever-mermaid-code-block > pre { display: none; margin: 8px 0 0; }
   .edgeever-mermaid-code-block.is-source-visible > pre { display: block; }
-  .edgeever-mermaid-preview { display: flex; min-height: 104px; align-items: center; justify-content: flex-start; overflow-x: auto; padding: 16px 4px; background: transparent; }
+  .edgeever-mermaid-preview { display: flex; min-height: 72px; align-items: center; justify-content: flex-start; overflow-x: auto; padding: 8px 4px; background: transparent; }
   .edgeever-mermaid-preview[hidden] { display: none; }
   .edgeever-mermaid-svg { display: flex; width: max-content; min-width: 100%; flex: none; justify-content: center; }
   .edgeever-mermaid-svg svg { display: block; max-width: none; max-height: none; flex: none; }
